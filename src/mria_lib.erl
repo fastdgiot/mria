@@ -21,8 +21,10 @@
         , txid_to_checkpoint/1
         , make_key/1
         , import_batch/2
+
         , rpc_call/4
         , rpc_cast/4
+
         , shuffle/1
         , send_after/3
         , cancel_timer/1
@@ -39,6 +41,8 @@
         , shutdown_process/1
         , exec_callback/1
         , exec_callback_async/1
+
+        , sup_child_pid/2
         ]).
 
 %% Internal exports
@@ -55,11 +59,14 @@
              , mnesia_tid/0
              , txid/0
              , rlog/0
+             , rpc_destination/0
              ]).
 
 -include_lib("snabbkaffe/include/trace.hrl").
 -include("mria_rlog.hrl").
 -include_lib("mnesia/src/mnesia.hrl").
+
+-compile({inline, [node_from_destination/1]}).
 
 %%================================================================================
 %% Type declarations
@@ -85,6 +92,8 @@
                       }.
 
 -type subscriber() :: {node(), pid()}.
+
+-type rpc_destination() :: node() | {node(), _SerializationKey}.
 
 %%================================================================================
 %% RLOG key creation
@@ -176,20 +185,38 @@ import_op_dirty({{Tab, _K}, Record, write}) ->
 %%================================================================================
 
 %% @doc Do an RPC call
--spec rpc_call(node(), module(), atom(), list()) -> term().
-rpc_call(Node, Module, Function, Args) ->
-    Mod = mria_config:rpc_module(),
-    apply(Mod, call, [Node, Module, Function, Args]).
+-spec rpc_call(rpc_destination(), module(), atom(), list()) -> term().
+rpc_call(Destination, Module, Function, Args) ->
+    case mria_config:rpc_module() of
+        rpc ->
+            rpc:call(node_from_destination(Destination), Module, Function, Args);
+        gen_rpc ->
+            gen_rpc:call(Destination, Module, Function, Args)
+    end.
 
 %% @doc Do an RPC cast
--spec rpc_cast(node(), module(), atom(), list()) -> term().
-rpc_cast(Node, Module, Function, Args) ->
-    Mod = mria_config:rpc_module(),
-    apply(Mod, cast, [Node, Module, Function, Args]).
+-spec rpc_cast(rpc_destination(), module(), atom(), list()) -> term().
+rpc_cast(Destination, Module, Function, Args) ->
+    case mria_config:rpc_module() of
+        rpc ->
+            rpc:cast(node_from_destination(Destination), Module, Function, Args);
+        gen_rpc ->
+            gen_rpc:cast(Destination, Module, Function, Args)
+    end.
 
 %%================================================================================
 %% Misc functions
 %%================================================================================
+
+-spec sup_child_pid(_SupRef, _ChildId) -> {ok, pid()} | undefined.
+sup_child_pid(SupRef, ChildId) ->
+    Children = [Child || {Id, Child, _, _} <- supervisor:which_children(SupRef), Id =:= ChildId],
+    case Children of
+        [Pid] when is_pid(Pid) ->
+            {ok, Pid};
+        _ ->
+            undefined
+    end.
 
 %% @doc Random shuffle of a small list.
 -spec shuffle([A]) -> [A].
@@ -207,6 +234,7 @@ send_after(Timeout, To, Message) ->
 cancel_timer(undefined) ->
     ok;
 cancel_timer(TRef) ->
+    %% TODO: flush the message from the MQ
     erlang:cancel_timer(TRef).
 
 -spec subscriber_node(subscriber()) -> node().
@@ -226,7 +254,7 @@ call_backend_rw_trans(Shard, Function, Args) ->
             transactional_wrapper(Shard, Function, Args);
         {rlog, replicant, _} ->
             Core = find_upstream_node(Shard),
-            mria_lib:rpc_call(Core, ?MODULE, transactional_wrapper, [Shard, Function, Args])
+            mria_lib:rpc_call({Core, Shard}, ?MODULE, transactional_wrapper, [Shard, Function, Args])
     end.
 
 -spec call_backend_rw_dirty(atom(), mria:table(), list()) -> term().
@@ -245,7 +273,7 @@ call_backend_rw_dirty(Function, Table, Args) ->
                 false ->
                     %% Run dirty operation via RPC:
                     Core = find_upstream_node(Shard),
-                    mria_lib:rpc_call(Core, ?MODULE, dirty_wrapper,
+                    mria_lib:rpc_call({Core, Shard}, ?MODULE, dirty_wrapper,
                                       [Shard, Function, Table, Args])
             end
     end.
@@ -327,7 +355,7 @@ shutdown_process(Pid) when is_pid(Pid) ->
             ok
     end.
 
--spec exec_callback(mria_config:callback()) -> ok.
+-spec exec_callback(mria_config:callback()) -> term().
 exec_callback(Name) ->
     ?tp(mria_exec_callback, #{type => Name}),
     case mria_config:callback(Name) of
@@ -357,7 +385,7 @@ exec_callback_async(Name) ->
 
 -spec find_upstream_node(mria_rlog:shard()) -> node().
 find_upstream_node(Shard) ->
-    case mria_status:get_core_node(Shard, 5000) of
+    case mria_status:get_core_node(Shard, infinity) of
         {ok, Node} -> Node;
         timeout    -> error(transaction_timeout)
     end.
@@ -389,3 +417,9 @@ do_ensure_no_ops_outside_shard(TxStore, Shard) ->
                  , Tables
                  ),
     ok.
+
+-spec node_from_destination(rpc_destination()) -> node().
+node_from_destination({Node, _SerializationKey}) ->
+    Node;
+node_from_destination(Node) ->
+    Node.

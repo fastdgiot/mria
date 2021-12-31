@@ -19,6 +19,7 @@
 
 -compile(export_all).
 -compile(nowarn_export_all).
+-compile(nowarn_underscore_match).
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
@@ -61,6 +62,69 @@ t_create_del_table(_) ->
     after
         application:stop(mria),
         mria_mnesia:ensure_stopped()
+    end.
+
+t_disc_table(_) ->
+    Cluster = mria_ct:cluster([core, core, replicant], mria_mnesia_test_util:common_env()),
+    try
+        Nodes = mria_ct:start_cluster(mria, Cluster),
+        Fun = fun() ->
+                      ok = mria:create_table(kv_tab1,
+                                             [{storage, disc_copies},
+                                              {rlog_shard, test_shard},
+                                              {record_name, kv_tab},
+                                              {attributes, record_info(fields, kv_tab)}
+                                             ]),
+                      ok = mria:create_table(kv_tab2,
+                                             [{storage, disc_only_copies},
+                                              {rlog_shard, test_shard},
+                                              {record_name, kv_tab},
+                                              {attributes, record_info(fields, kv_tab)}
+                                             ]),
+                      ?assertMatch([], mnesia:dirty_all_keys(kv_tab1)),
+                      ?assertMatch([], mnesia:dirty_all_keys(kv_tab2))
+              end,
+        [ok = mria_ct:run_on(N, Fun) || N <- Nodes]
+    after
+        ok = mria_ct:teardown_cluster(Cluster)
+    end.
+
+t_rocksdb_table(_) ->
+    EnvOverride = [{mnesia_rocksdb, semantics, fast}],
+    Cluster = mria_ct:cluster( [core, {core, EnvOverride}]
+                             , mria_mnesia_test_util:common_env()
+                             ),
+    try
+        Nodes = mria_ct:start_cluster(mria, Cluster),
+        CreateTab =
+            fun() ->
+                    ok = mria:create_table(kv_tab,
+                                           [{storage, rocksdb_copies},
+                                            {rlog_shard, test_shard},
+                                            {record_name, kv_tab},
+                                            {attributes, record_info(fields, kv_tab)}
+                                           ]),
+                    {atomic, Ret} =
+                        mria:transaction(test_shard,
+                                         fun() ->
+                                                 mnesia:write(#kv_tab{key = node(), val = node()})
+                                         end),
+                    Ret
+            end,
+        ReadTab =
+            fun() ->
+                    {atomic, Val} =
+                        mria:ro_transaction(test_shard,
+                                            fun() ->
+                                                    [#kv_tab{val = Val}] = mnesia:read(kv_tab, node()),
+                                                    Val
+                                            end),
+                    Val
+            end,
+        [ok = mria_ct:run_on(N, CreateTab) || N <- Nodes],
+        [N = mria_ct:run_on(N, ReadTab)    || N <- Nodes]
+    after
+        ok = mria_ct:teardown_cluster(Cluster)
     end.
 
 %% -spec(join_cluster(node()) -> ok).
@@ -134,28 +198,33 @@ t_rlog_smoke_test(_) ->
     Env = [ {mria, bootstrapper_chunk_config, #{count_limit => 3}}
           | mria_mnesia_test_util:common_env()
           ],
+    NTrans = 300,
     Cluster = mria_ct:cluster([core, core, replicant], Env),
     CounterKey = counter,
     ?check_trace(
-       #{timetrap => 10000},
+       #{timetrap => NTrans * 10 + 10000},
        try
            %% Inject some orderings to make sure the replicant
            %% receives transactions in all states.
            %%
            %% 1. Commit some transactions before the replicant start:
-           ?force_ordering(#{?snk_kind := trans_gen_counter_update, value := 5}, #{?snk_kind := state_change, to := disconnected}),
+           ?force_ordering(#{?snk_kind := trans_gen_counter_update, value := 5},
+                           #{?snk_kind := state_change, to := disconnected}),
            %% 2. Make sure the rest of transactions are produced after the agent starts:
-           ?force_ordering(#{?snk_kind := subscribe_realtime_stream}, #{?snk_kind := trans_gen_counter_update, value := 10}),
+           ?force_ordering(#{?snk_kind := subscribe_realtime_stream},
+                           #{?snk_kind := trans_gen_counter_update, value := 10}),
            %% 3. Make sure transactions are sent during TLOG replay: (TODO)
-           ?force_ordering(#{?snk_kind := state_change, to := bootstrap}, #{?snk_kind := trans_gen_counter_update, value := 15}),
+           ?force_ordering(#{?snk_kind := state_change, to := bootstrap},
+                           #{?snk_kind := trans_gen_counter_update, value := 15}),
            %% 4. Make sure some transactions are produced while in normal mode
-           ?force_ordering(#{?snk_kind := state_change, to := normal}, #{?snk_kind := trans_gen_counter_update, value := 25}),
+           ?force_ordering(#{?snk_kind := state_change, to := normal},
+                           #{?snk_kind := trans_gen_counter_update, value := 25}),
 
            Nodes = [N1, N2, N3] = mria_ct:start_cluster(mria_async, Cluster),
            ok = mria_mnesia_test_util:wait_tables([N1, N2]),
            %% Generate some transactions:
            {atomic, _} = rpc:call(N2, mria_transaction_gen, create_data, []),
-           ok = rpc:call(N1, mria_transaction_gen, counter, [CounterKey, 30]),
+           ok = rpc:call(N1, mria_transaction_gen, counter, [CounterKey, NTrans]),
            mria_mnesia_test_util:stabilize(1000),
            %% Check status:
            [?assertMatch(#{}, rpc:call(N, mria, info, [])) || N <- Nodes],
@@ -175,6 +244,7 @@ t_rlog_smoke_test(_) ->
            ok
        end,
        fun([N1, N2, N3], Trace) ->
+               ?assert(mria_rlog_props:no_tlog_gaps(Trace)),
                %% Ensure that the nodes assumed designated roles:
                ?projection_complete(node, ?of_kind(rlog_server_start, Trace), [N1, N2]),
                ?projection_complete(node, ?of_kind(rlog_replica_start, Trace), [N3]),
@@ -228,7 +298,7 @@ t_abort(_) ->
        after
            mria_ct:teardown_cluster(Cluster)
        end,
-       fun(_, Trace) ->
+       fun(Trace) ->
                ?assertMatch([], ?of_kind(rlog_import_trans, Trace))
        end).
 
@@ -241,7 +311,7 @@ t_core_node_competing_writes(_) ->
     ?check_trace(
        #{timetrap => 30000},
        try
-           Nodes = [N1, N2, N3] = mria_ct:start_cluster(mria, Cluster),
+           Nodes = [N1, N2, _N3] = mria_ct:start_cluster(mria, Cluster),
            mria_mnesia_test_util:wait_tables(Nodes),
            spawn(fun() ->
                          rpc:call(N1, mria_transaction_gen, counter, [CounterKey, NOper]),
@@ -249,12 +319,11 @@ t_core_node_competing_writes(_) ->
                  end),
            ok = rpc:call(N2, mria_transaction_gen, counter, [CounterKey, NOper]),
            ?block_until(#{?snk_kind := n1_counter_done}),
-           mria_mnesia_test_util:wait_full_replication(Cluster),
-           N3
+           mria_mnesia_test_util:wait_full_replication(Cluster)
        after
            mria_ct:teardown_cluster(Cluster)
        end,
-       fun(_N3, Trace) ->
+       fun(Trace) ->
                Events = [Val || #{?snk_kind := rlog_import_trans, ops := Ops} <- Trace,
                                 {{test_tab, _}, {test_tab, _Key, Val}, write} <- Ops],
                %% Check that the number of imported transaction equals to the expected number:
@@ -279,9 +348,7 @@ t_rlog_clear_table(_) ->
        after
            mria_ct:teardown_cluster(Cluster)
        end,
-       fun(_, _) ->
-               true
-       end).
+       []).
 
 t_rlog_dirty_operations(_) ->
     Cluster = mria_ct:cluster([core, core, replicant], mria_mnesia_test_util:common_env()),
@@ -316,22 +383,22 @@ t_rlog_dirty_operations(_) ->
        after
            mria_ct:teardown_cluster(Cluster)
        end,
-       fun(_, Trace) ->
-               ?assert(mria_rlog_props:replicant_no_restarts(Trace))
-       end).
+       [ fun mria_rlog_props:replicant_no_restarts/1
+       ]).
 
 t_local_content(_) ->
-    Cluster = mria_ct:cluster([core, replicant], mria_mnesia_test_util:common_env()),
+    Cluster = mria_ct:cluster([core, core, replicant], mria_mnesia_test_util:common_env()),
     ?check_trace(
        #{timetrap => 30000},
        try
-          Nodes = [N1, N2] = mria_ct:start_cluster(mria, Cluster),
+          Nodes = mria_ct:start_cluster(mria, Cluster),
           %% Create the table on all nodes:
-          {[ok, ok], []} = rpc:multicall(Nodes, mria, create_table,
-                                         [local_tab,
-                                          [{local_content, true}]
-                                         ]),
-          %% Perform an invalid r/w transactions on both nodes:
+          {[ok, ok, ok], []} = rpc:multicall(Nodes, mria, create_table,
+                                             [local_tab,
+                                              [{local_content, true}]
+                                             ]),
+          %% Perform an invalid r/w transactions on all nodes:
+          %%   Write to a non-local table in a local content shard:
           [?assertMatch( {aborted, {invalid_transaction, _, _}}
                        , rpc:call(N, mria, transaction,
                                   [mria:local_content_shard(),
@@ -341,6 +408,7 @@ t_local_content(_) ->
                                   ])
                        )
            || N <- Nodes],
+          %%   Write to a local table in a non-local shard:
           [?assertMatch( {aborted, {invalid_transaction, _, _}}
                        , rpc:call(N, mria, transaction,
                                   [test_shard,
@@ -350,25 +418,17 @@ t_local_content(_) ->
                                   ])
                        )
            || N <- Nodes],
-          %% Perform r/w transactions on both nodes with different content:
-          ?assertMatch( {atomic, N1}
-                      , rpc:call(N1, mria, transaction,
+          %% Perform valid r/w transactions on all nodes with different content:
+          [?assertMatch( {atomic, N}
+                       , rpc:call(N, mria, transaction,
                                   [mria:local_content_shard(),
                                    fun() ->
-                                           mnesia:write({local_tab, key, node()}),
+                                           ok = mnesia:write({local_tab, key, node()}),
                                            node()
                                    end
                                   ])
-                       ),
-          ?assertMatch( {atomic, N2}
-                      , rpc:call(N2, mria, transaction,
-                                  [mria:local_content_shard(),
-                                   fun() ->
-                                           mnesia:write({local_tab, key, node()}),
-                                           node()
-                                   end
-                                  ])
-                       ),
+                       )
+           || N <- Nodes],
           %% Perform a successful r/o transaction:
           [?assertMatch( {atomic, N}
                        , rpc:call(N, mria, ro_transaction,
@@ -396,9 +456,7 @@ t_local_content(_) ->
       after
           mria_ct:teardown_cluster(Cluster)
       end,
-      fun(_, _) ->
-              true
-      end).
+      []).
 
 %% This testcase verifies verifies various modes of mria:ro_transaction
 t_sum_verify(_) ->
@@ -407,10 +465,17 @@ t_sum_verify(_) ->
     ?check_trace(
        #{timetrap => 30000},
        try
-           ?force_ordering( #{?snk_kind := verify_trans_step, n := N} when N =:= NTrans div 3
+           ?force_ordering( #{?snk_kind := verify_trans_step, n := N} when N =:= NTrans div 4
+                          , #{?snk_kind := state_change, to := bootstrap}
+                          ),
+           ?force_ordering( #{?snk_kind := verify_trans_step, n := N} when N =:= 2 * NTrans div 4
+                          , #{?snk_kind := state_change, to := local_replay}
+                          ),
+           ?force_ordering( #{?snk_kind := verify_trans_step, n := N} when N =:= 3 * NTrans div 4
                           , #{?snk_kind := state_change, to := normal}
                           ),
-           Nodes = mria_ct:start_cluster(mria, Cluster),
+           Nodes = mria_ct:start_cluster(mria_async, Cluster),
+           timer:sleep(1000),
            [ok = rpc:call(N, mria_transaction_gen, verify_trans_sum, [NTrans, 10])
             || N <- lists:reverse(Nodes)],
            [?block_until(#{?snk_kind := verify_trans_sum, node := N}, 5000)
@@ -418,7 +483,7 @@ t_sum_verify(_) ->
        after
            mria_ct:teardown_cluster(Cluster)
        end,
-       fun(_, Trace) ->
+       fun(Trace) ->
                ?assert(mria_rlog_props:replicant_no_restarts(Trace)),
                ?assertMatch( [#{result := ok}, #{result := ok}]
                            , ?of_kind(verify_trans_sum, Trace)
@@ -465,9 +530,7 @@ t_core_node_down(_) ->
        after
            mria_ct:teardown_cluster(Cluster)
        end,
-       fun(_, _Trace) ->
-               true
-       end).
+       []).
 
 t_dirty_reads(_) ->
     Cluster = mria_ct:cluster([core, replicant], mria_mnesia_test_util:common_env()),

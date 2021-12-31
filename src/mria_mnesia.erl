@@ -43,6 +43,7 @@
         , running_nodes/0
         , is_node_in_cluster/0
         , is_node_in_cluster/1
+        , db_nodes/0
         ]).
 
 %% Dir, schema and tables
@@ -64,6 +65,7 @@
 %% @doc Initialize Mnesia
 -spec ensure_schema() -> ok | {error, _}.
 ensure_schema() ->
+    ?tp(debug, "Ensure mnesia schema", #{}),
     mria_lib:ensure_ok(ensure_data_dir()),
     mria_lib:ensure_ok(init_schema()).
 
@@ -71,6 +73,7 @@ ensure_schema() ->
 ensure_started() ->
     ok = mnesia:start(),
     {ok, _} = mria_mnesia_null_storage:register(),
+    {ok, _} = mnesia_rocksdb:register(),
     wait_for(start).
 
 %% @doc Ensure mnesia stopped
@@ -203,6 +206,11 @@ running_nodes() ->
             end
     end.
 
+%% @doc List Mnesia DB nodes.  Used by `mria_lb' to check if nodes
+%% reported by core discovery callback are in the same cluster.
+db_nodes() ->
+    mnesia:system_info(db_nodes).
+
 %% @doc Is this node in mnesia cluster?
 is_node_in_cluster() ->
     mria_mnesia:cluster_nodes(all) =/= [node()].
@@ -252,7 +260,7 @@ copy_table(Name, Storage) ->
             ?LOG(warning, "Ignoring illegal attempt to create a table copy ~p on replicant node ~p", [Name, node()])
     end.
 
--spec wait_for_tables([mria:table()]) -> ok | {error, _Reason} | {timeout, [mria:table()]}.
+-spec wait_for_tables([mria:table()]) -> ok | {error, _Reason}.
 wait_for_tables(Tables) ->
     ?tp(mria_wait_for_tables, #{tables => Tables}),
     case mnesia:wait_for_tables(Tables, 30000) of
@@ -305,7 +313,9 @@ init_schema() ->
               end,
     case (mria_rlog:role() =:= replicant) orelse IsAlone of
         true ->
-            mnesia:create_schema([node()]);
+            Ret = mnesia:create_schema([node()]),
+            ?tp(notice, "Creating new mnesia schema", #{result => Ret}),
+            mria_lib:ensure_ok(Ret);
         false ->
             ok
     end.

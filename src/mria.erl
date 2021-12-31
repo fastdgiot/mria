@@ -122,7 +122,8 @@ stop(Reason) ->
     %% We cannot run stop callback in `mria_app', since we don't want
     %% to block application controller:
     mria_lib:exec_callback(stop),
-    application:stop(mria).
+    application:stop(mria),
+    application:stop(mnesia).
 
 %%--------------------------------------------------------------------
 %% Info
@@ -221,13 +222,10 @@ create_table(Name, TabDef) ->
     MnesiaTabDef = lists:keydelete(rlog_shard, 1, lists:keydelete(storage, 1, TabDef)),
     case {proplists:get_value(rlog_shard, TabDef, ?LOCAL_CONTENT_SHARD),
           proplists:get_value(local_content, TabDef, false)} of
-        {?LOCAL_CONTENT_SHARD, true} ->
-            %% Local content table:
-            create_table_internal(Name, Storage, MnesiaTabDef);
         {?LOCAL_CONTENT_SHARD, false} ->
             ?LOG(critical, "Table ~p doesn't belong to any shard", [Name]),
             error(badarg);
-        {Shard, false} ->
+        {Shard, _LocalContent} ->
             case create_table_internal(Name, Storage, MnesiaTabDef) of
                 ok ->
                     %% It's important to add the table to the shard
@@ -240,13 +238,10 @@ create_table(Name, TabDef) ->
                     mria_schema:add_entry(Entry);
                 Err ->
                     Err
-            end;
-        {_Shard, true} ->
-            ?LOG(critical, "local_content table ~p should belong to ?LOCAL_CONTENT_SHARD.", [Name]),
-            error(badarg)
+            end
     end.
 
--spec wait_for_tables([table()]) -> ok | {error, _Reason} | {timeout, [table()]}.
+-spec wait_for_tables([table()]) -> ok | {error, _Reason}.
 wait_for_tables(Tables) ->
     case mria_mnesia:wait_for_tables(Tables) of
         ok ->
@@ -308,7 +303,7 @@ transaction(Shard, Fun, Args) ->
 
 -spec transaction(mria_rlog:shard(), fun(() -> A)) -> t_result(A).
 transaction(Shard, Fun) ->
-    transaction(Shard, fun erlang:apply/2, [Fun, []]).
+    transaction(Shard, Fun, []).
 
 -spec clear_table(mria:table()) -> t_result(ok).
 clear_table(Table) ->
@@ -346,7 +341,7 @@ dirty_delete_object(Record) ->
 -spec ro_trans_rpc(mria_rlog:shard(), fun(() -> A)) -> t_result(A).
 ro_trans_rpc(Shard, Fun) ->
     {ok, Core} = mria_status:get_core_node(Shard, 5000),
-    case mria_lib:rpc_call(Core, ?MODULE, ro_transaction, [Shard, Fun]) of
+    case mria_lib:rpc_call({Core, Shard}, ?MODULE, ro_transaction, [Shard, Fun]) of
         {badrpc, Err} ->
             ?tp(error, ro_trans_badrpc,
                 #{ core   => Core
@@ -363,13 +358,13 @@ ro_trans_rpc(Shard, Fun) ->
             Ans
     end.
 
--spec do_join(node(), join_reason()) -> ok | ignore | {error, _}.
+-spec do_join(node(), join_reason()) -> ok | ignore.
 do_join(Node, Reason) ->
   case mria_rlog:role(Node) of
       core ->
           ?tp(notice, "Mria is restarting to join the core cluster", #{seed => Node}),
           mria_membership:announce(Reason),
-          stop(),
+          stop(Reason),
           ok = mria_mnesia:join_cluster(Node),
           start(),
           ?tp(notice, "Mria has joined the core cluster",

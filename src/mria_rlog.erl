@@ -18,6 +18,7 @@
 -module(mria_rlog).
 
 -export([ status/0
+        , get_protocol_version/0
 
         , role/0
         , role/1
@@ -79,7 +80,7 @@ backend() ->
 
 -spec core_nodes() -> [node()].
 core_nodes() ->
-    application:get_env(mria, core_nodes, []).
+    mria_lb:core_nodes().
 
 -spec wait_for_shards([shard()], timeout()) -> ok | {timeout, [shard()]}.
 wait_for_shards(Shards0, Timeout) ->
@@ -94,7 +95,7 @@ wait_for_shards(Shards0, Timeout) ->
 
 -spec ensure_shard(shard()) -> ok.
 ensure_shard(Shard) ->
-    case mria_rlog_sup:start_shard(Shard) of
+    case mria_shards_sup:start_shard(Shard) of
         {ok, _}                       -> ok;
         {error, already_present}      -> ok;
         {error, {already_started, _}} -> ok;
@@ -113,7 +114,13 @@ subscribe(Shard, RemoteNode, Subscriber, Checkpoint) ->
         true ->
             MyNode = node(),
             Args = [Shard, {MyNode, Subscriber}, Checkpoint],
-            mria_lib:rpc_call(RemoteNode, mria_rlog_server, subscribe, Args);
+            mria_lib:rpc_call({RemoteNode, Shard}, mria_rlog_server, subscribe, Args);
         false ->
             {badrpc, probe_failed}
     end.
+
+%% @doc Get version of Mria protocol running on the node
+-spec get_protocol_version() -> integer().
+get_protocol_version() ->
+    %% Should be increased on incompatible changes:
+    0.

@@ -20,6 +20,7 @@
 -export([ role/0
         , backend/0
         , rpc_module/0
+        , tlog_push_mode/0
         , strict_mode/0
 
         , load_config/0
@@ -30,9 +31,11 @@
         , erase_shard_config/1
         , shard_rlookup/1
         , shard_config/1
+        , core_node_discovery_callback/0
 
           %% Callbacks
         , register_callback/2
+        , unregister_callback/1
         , callback/1
         ]).
 
@@ -45,7 +48,8 @@
 
 -type callback() :: start
                   | stop
-                  | {start | stop, mria_rlog:shard()}.
+                  | {start | stop, mria_rlog:shard()}
+                  | core_node_discovery.
 
 -export_type([callback/0]).
 
@@ -83,6 +87,10 @@ role() ->
 rpc_module() ->
     persistent_term:get(?mria(rlog_rpc_module), gen_rpc).
 
+-spec tlog_push_mode() -> sync | async.
+tlog_push_mode() ->
+    persistent_term:get(?mria(tlog_push_mode), async).
+
 %% Flag that enables additional verification of transactions
 -spec strict_mode() -> boolean().
 strict_mode() ->
@@ -94,6 +102,7 @@ load_config() ->
     copy_from_env(db_backend),
     copy_from_env(node_role),
     copy_from_env(strict_mode),
+    copy_from_env(tlog_push_mode),
     consistency_check().
 
 -spec load_shard_config(mria_rlog:shard(), [mria:table()]) -> ok.
@@ -108,11 +117,25 @@ load_shard_config(Shard, Tables) ->
               },
     ok = persistent_term:put(?shard_config(Shard), Config).
 
--spec register_callback(mria_config:callback(), function()) -> ok.
+-spec core_node_discovery_callback() -> fun(() -> [node()]).
+core_node_discovery_callback() ->
+    case callback(core_node_discovery) of
+        {ok, Fun} ->
+            Fun;
+        undefined ->
+            %% Default function
+            fun() -> application:get_env(mria, core_nodes, []) end
+    end.
+
+-spec register_callback(mria_config:callback(), fun(() -> term())) -> ok.
 register_callback(Name, Fun) ->
     apply(application, set_env, [mria, {callback, Name}, Fun]).
 
--spec callback(mria_config:callback()) -> {ok, function()} | undefined.
+-spec unregister_callback(mria_config:callback()) -> ok.
+unregister_callback(Name) ->
+    apply(application, unset_env, [mria, {callback, Name}]).
+
+-spec callback(mria_config:callback()) -> {ok, fun(() -> term())} | undefined.
 callback(Name) ->
     apply(application, get_env, [mria, {callback, Name}]).
 

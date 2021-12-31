@@ -168,11 +168,11 @@ handle_info({mnesia_system_event, {inconsistent_database, Context, Node}},
     {noreply, State#state{partitions = lists:usort([Node | Partitions])}};
 
 handle_info({mnesia_system_event, {mnesia_overload, Details}}, State) ->
-    logger:error("Mnesia overload: ~p", [Details]),
+    logger:warning("Mnesia overload: ~p", [Details]),
     {noreply, State};
 
 handle_info({mnesia_system_event, Event}, State) ->
-    logger:error("Mnesia system event: ~p", [Event]),
+    logger:info("Mnesia system event: ~p", [Event]),
     {noreply, State};
 
 %% Confirm if we should report the partitions
@@ -193,11 +193,11 @@ handle_info({autoheal, Msg}, State) ->
     {noreply, autoheal_handle_msg(Msg, State)};
 
 handle_info(heartbeat, State) ->
-    AliveNodes = [N || N <- mria_mnesia:cluster_nodes(all),
-                       lists:member(N, nodes())],
     lists:foreach(fun(Node) ->
-                    cast(Node, {heartbeat, node()})
-                  end, AliveNodes),
+                      if Node =/= node() -> cast(Node, {heartbeat, node()});
+                         true            -> ok
+                      end
+                  end, mria_mnesia:cluster_nodes(all)),
     {noreply, ensure_heartbeat(State#state{heartbeat = undefined})};
 
 handle_info(Msg = {'EXIT', Pid, _Reason}, State = #state{autoheal = Autoheal}) ->

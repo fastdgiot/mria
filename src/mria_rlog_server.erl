@@ -76,7 +76,7 @@ start_link(Parent, Shard) ->
 %% server is lost or delayed due to network congestion.
 -spec probe(node(), mria_rlog:shard()) -> boolean().
 probe(Node, Shard) ->
-    mria_lib:rpc_call(Node, ?MODULE, do_probe, [Shard]) =:= true.
+    mria_lb:probe(Node, Shard).
 
 -spec subscribe(mria_rlog:shard(), mria_lib:subscriber(), checkpoint()) ->
           { ok
@@ -101,6 +101,7 @@ bootstrap_me(RemoteNode, Shard) ->
 %%================================================================================
 
 init({Parent, Shard}) ->
+    process_flag(trap_exit, true),
     logger:set_process_metadata(#{ domain => [mria, rlog, server]
                                  , shard => Shard
                                  }),
@@ -122,8 +123,8 @@ handle_continue(post_init, {Parent, Shard}) ->
     ok = mria_rlog_tab:ensure_table(Shard),
     Tables = process_schema(Shard),
     mria_config:load_shard_config(Shard, Tables),
-    AgentSup = mria_rlog_shard_sup:start_agent_sup(Parent, Shard),
-    BootstrapperSup = mria_rlog_shard_sup:start_bootstrapper_sup(Parent, Shard),
+    AgentSup = mria_core_shard_sup:start_agent_sup(Parent, Shard),
+    BootstrapperSup = mria_core_shard_sup:start_bootstrapper_sup(Parent, Shard),
     mria_mnesia:wait_for_tables([Shard|Tables]),
     mria_status:notify_shard_up(Shard, self()),
     ?tp(notice, "Shard fully up",
@@ -162,7 +163,7 @@ handle_call({bootstrap, Subscriber}, _From, State) ->
     {reply, {ok, Pid}, State};
 handle_call(probe, _From, State) ->
     {reply, true, State};
-handle_call(_From, Call, St) ->
+handle_call(Call, _From, St) ->
     {reply, {error, {unknown_call, Call}}, St}.
 
 code_change(_OldVsn, St, _Extra) ->
@@ -218,8 +219,8 @@ handle_mnesia_event(#?schema{mnesia_table = NewTab, shard = ChangedShard}, Activ
             Tables = mria_schema:tables_of_shard(Shard),
             mria_config:load_shard_config(Shard, Tables),
             %% Shut down all the downstream connections by restarting the supervisors:
-            AgentSup = mria_rlog_shard_sup:restart_agent_sup(Parent),
-            BootstrapperSup = mria_rlog_shard_sup:restart_bootstrapper_sup(Parent),
+            AgentSup = mria_core_shard_sup:restart_agent_sup(Parent),
+            BootstrapperSup = mria_core_shard_sup:restart_bootstrapper_sup(Parent),
             {noreply, St0#s{ agent_sup        = AgentSup
                            , bootstrapper_sup = BootstrapperSup
                            }};
@@ -235,6 +236,6 @@ handle_mnesia_event(#?schema{mnesia_table = NewTab, shard = ChangedShard}, Activ
 do_bootstrap(Shard, Subscriber) ->
     gen_server:call(Shard, {bootstrap, Subscriber}, infinity).
 
--spec do_probe(mria_rlog:shard()) -> true.
+-spec do_probe(mria_rlog:shard()) -> {true, integer()}.
 do_probe(Shard) ->
-    gen_server:call(Shard, probe, 1000).
+    {gen_server:call(Shard, probe, 1000), mria_rlog:get_protocol_version()}.

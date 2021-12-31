@@ -14,9 +14,12 @@
 %% limitations under the License.
 %%--------------------------------------------------------------------
 
+%% NOTE: Concuerror doesn't pick up testcases automatically, add them
+%% to the Makefile explicitly
 -module(concuerror_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-define(CONCUERROR, true).
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 %% Note: the number of interleavings that Concuerror has to explore
@@ -25,9 +28,132 @@
 %% this module should be kept as short and simple as possible and only
 %% verify a single property.
 
+cvar_read_test() ->
+    mria_condition_var:init(),
+    try
+        Val = 42,
+        spawn(fun() ->
+                      mria_condition_var:set(foo, Val)
+              end),
+        case mria_condition_var:read(foo, 100) of
+            {ok, Val} -> ok;
+            timeout   -> ok
+        end,
+        ?assertEqual(Val, mria_condition_var:read(foo))
+    after
+        cleanup()
+    end.
+
+cvar_unset_test() ->
+    mria_condition_var:init(),
+    try
+        Val = 42,
+        mria_condition_var:set(foo, Val),
+        ?assertEqual({ok, Val}, mria_condition_var:peek(foo)),
+        spawn(fun() ->
+                      catch mria_condition_var:unset(foo)
+              end),
+        case mria_condition_var:read(foo, 10) of
+            {ok, Val} -> ok;
+            timeout   -> ?assertMatch(undefined, mria_condition_var:peek(foo))
+        end
+    after
+        %% Set the variable to avoid "deadlocked" error detected by
+        %% concuerror for the waker process:
+        mria_condition_var:set(foo, 1),
+        cleanup()
+    end.
+
+%% Check multiple processes waiting for a condition var
+cvar_double_wait_test() ->
+    mria_condition_var:init(),
+    try
+        Val = 42,
+        Parent = self(),
+        [spawn(fun() ->
+                       Parent ! mria_condition_var:read(foo)
+               end) || _ <- [1, 2]],
+        ?assertMatch(ok, mria_condition_var:set(foo, Val)),
+        receive Val -> ok end,
+        receive Val -> ok end,
+        ?assertEqual({ok, Val}, mria_condition_var:peek(foo))
+    after
+        cleanup()
+    end.
+
+%% Check that killing a waiter process doesn't block other waiters
+cvar_waiter_killed_test() ->
+    mria_condition_var:init(),
+    try
+        Val = 42,
+        Waiter = spawn(fun() ->
+                               catch mria_condition_var:read(foo)
+                       end),
+        _Killer = spawn(fun() ->
+                                exit(Waiter, shutdown)
+                        end),
+        _Setter = spawn(fun() ->
+                                mria_condition_var:set(foo, Val)
+                        end),
+        ?assertEqual(Val, mria_condition_var:read(foo)),
+        ?assertEqual({ok, Val}, mria_condition_var:peek(foo))
+    after
+        cleanup()
+    end.
+
+%% Check infinite waiting for multiple variables
+cvar_wait_multiple_test() ->
+    mria_condition_var:init(),
+    try
+        Val = 42,
+        [spawn(fun() ->
+                       mria_condition_var:set(Key, Val)
+               end) || Key <- [foo, bar]],
+        ?assertMatch(ok, mria_condition_var:wait_vars([foo, bar], infinity)),
+        ?assertEqual({ok, Val}, mria_condition_var:peek(foo)),
+        ?assertEqual({ok, Val}, mria_condition_var:peek(bar))
+    after
+        cleanup()
+    end.
+
+%% Check waiting for multiple variables
+cvar_wait_multiple_timeout_test() ->
+    mria_condition_var:init(),
+    try
+        [spawn(fun() ->
+                       catch mria_condition_var:set(Key, Key)
+               end) || Key <- [foo, bar]],
+        Done = case mria_condition_var:wait_vars([foo, bar], 100) of
+                   ok           -> [foo, bar];
+                   {timeout, L} -> [foo, bar] -- L
+               end,
+        [?assertEqual({ok, I}, mria_condition_var:peek(I)) || I <- Done]
+    after
+        %% Set cvars to avoid "deadlocked" error detected by concuerror:
+        mria_condition_var:set(foo, 1),
+        mria_condition_var:set(bar, 2),
+        cleanup()
+    end.
+
+%% Check waiting for multiple variables, one times out.
+%%
+%% Note: it doesn't run under concuerror, since we rely on the precise
+%% timings here:
+cvar_wait_multiple_timeout_one_test() ->
+    mria_condition_var:init(),
+    try
+        [spawn(fun() ->
+                       timer:sleep(100),
+                       mria_condition_var:set(Key, Key)
+               end) || Key <- [foo, baz]],
+        ?assertMatch({timeout, [bar]}, mria_condition_var:wait_vars([foo, bar, baz], 200))
+    after
+        cleanup()
+    end.
+
 %% Check that waiting for shards with timeout=infinity always results in `ok'.
 wait_for_shards_inf_test() ->
-    {ok, Pid} = mria_status:start_link(),
+    mria_condition_var:init(),
     try
         spawn(fun() ->
                       catch mria_status:notify_shard_up(foo, self())
@@ -39,12 +165,12 @@ wait_for_shards_inf_test() ->
         ?assertMatch(ok, mria_status:wait_for_shards([foo, bar], infinity)),
         ?assertMatch([], flush())
     after
-        cleanup(Pid)
+        cleanup()
     end.
 
 %% Check that events published with different tags don't leave garbage messages behind
 notify_different_tags_test() ->
-    {ok, Pid} = mria_status:start_link(),
+    mria_condition_var:init(),
     try
         spawn(fun() ->
                       catch mria_status:notify_shard_up(foo, self())
@@ -55,12 +181,12 @@ notify_different_tags_test() ->
         ?assertMatch(ok, mria_status:wait_for_shards([foo], infinity)),
         ?assertMatch([], flush())
     after
-        cleanup(Pid)
+        cleanup()
     end.
 
 %% Test waiting for core node
 get_core_node_test() ->
-    {ok, Pid} = mria_status:start_link(),
+    mria_condition_var:init(),
     try
         Node = node(),
         spawn(fun() ->
@@ -69,12 +195,12 @@ get_core_node_test() ->
         ?assertMatch({ok, Node}, mria_status:get_core_node(foo, infinity)),
         ?assertMatch([], flush())
     after
-        cleanup(Pid)
+        cleanup()
     end.
 
 %% Check that waiting for shards with a finite timeout never hangs forever:
 wait_for_shards_timeout_test() ->
-    {ok, Pid} = mria_status:start_link(),
+    mria_condition_var:init(),
     try
         spawn(fun() ->
                       catch mria_status:notify_shard_up(foo, self())
@@ -92,18 +218,22 @@ wait_for_shards_timeout_test() ->
         end,
         ?assertMatch([], flush())
     after
-        cleanup(Pid)
+        %% Hack: set the variables to avoid "deadlocked" error from
+        %% concuerror for the waker processes:
+        mria_status:notify_shard_up(foo, self()),
+        mria_status:notify_shard_up(bar, self()),
+        cleanup()
     end.
 
 %% Check that waiting for events never results in infinite wait
 wait_for_shards_crash_test() ->
-    {ok, Pid} = mria_status:start_link(),
+    mria_condition_var:init(),
     try
         spawn(fun() ->
                       catch mria_status:notify_shard_up(foo, node())
               end),
         spawn(fun() ->
-                      exit(Pid, shutdown)
+                      catch mria_condition_var:stop()
               end),
         %% Check the result:
         try mria_status:wait_for_shards([foo], 100) of
@@ -113,11 +243,11 @@ wait_for_shards_crash_test() ->
             {timeout, _Shards} ->
                 ok
         catch
-            error:rlog_restarted -> ok
+            error:_ -> ok
         end,
         ?assertMatch([], flush())
     after
-        cleanup(Pid)
+        catch cleanup()
     end.
 
 %% Verify dirty bootstrap procedure (simplified).
@@ -207,12 +337,15 @@ flush() ->
             []
     end.
 
-cleanup(Pid) ->
-    unlink(Pid),
-    MRef = monitor(process, Pid),
-    exit(Pid, shutdown),
-    receive
-        {'DOWN', MRef, _, _, _} -> ok
-    end,
-    ets:delete(mria_rlog_replica_tab),
-    ets:delete(mria_rlog_stats_tab).
+cleanup() ->
+    case is_concuerror() of
+        true ->
+            %% Cleanup causes more interleavings, skip it:
+            ok;
+        false ->
+            catch mria_condition_var:stop()
+    end.
+
+%% Hack to detect if running under concuerror:
+is_concuerror() ->
+    code:is_loaded(concuerror) =/= false.

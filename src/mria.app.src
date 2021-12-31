@@ -8,17 +8,18 @@
     mria_node_monitor,
     mria_rlog_server,
     mria_lb,
-    mria_top_sup,
-    mria_rlog_sup
+    mria_rlog_sup,
+    mria_shards_sup
    ]},
+  %% Note: DON'T add mnesia to the list, or it will mess up start order:
   {applications,
    [kernel,
     stdlib,
-    mnesia,
     inets,
     gen_rpc,
     replayq,
-    snabbkaffe
+    snabbkaffe,
+    mnesia_rocksdb
    ]},
   {modules, []},
   {licenses, ["Apache 2.0"]},
